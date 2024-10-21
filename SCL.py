@@ -1,89 +1,12 @@
 # Import dependencies
 import torch
 import torch.nn as nn
-from torch.nn import Linear
 import torch.nn.functional as F
-import pickle
 from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import train_test_split
-import pandas as pd
+from sklearn.model_selection import KFold
 import numpy as np
-
-# Import pre-computed BERT CLS vectors and Feature Vectors
-with open('cls_emb.pkl', 'rb') as f:
-    cls = pickle.load(f)
-with open('feature_vectors.pkl', 'rb')as f:
-    feature_vectors= pickle.load(f)
-
-# The model needs numerical classes as base truth targets. Convert model names to 0, 1, 2
-response_df = pd.read_csv('final_data.csv')
-map_dict = {'llama3.1-70b':0, 'mistral':1, 'gpt-4o-2024-05-13':2}
-response_df['model_nums'] = response_df['model'].map(map_dict)
-model_nums = response_df['model_nums']
-
-# Concatenate the CLS and feature vectors
-embeddings = [torch.cat((cls[i].float(), torch.from_numpy(feature_vectors[i]).unsqueeze(0).float()), dim=1) for i in range(len(cls))]
-
-# Calculate the number of features to be used later as input to model
-NUM_FEATURES = embeddings[0].size(1)
-
-# Create a development and validation set by splitting indices
-RANDOM_STATE = 42
-indices = [i for i in range(len(embeddings))]
-dev_indices, val_indices = train_test_split(indices, test_size = 0.1, random_state = RANDOM_STATE)
-
-def extract_and_split_dev(temp, dev=True):
-    """
-    Returns split train, test, and dev sets based on temperature
-
-    temp: float indicating temperature
-    dev: boolean indicating if the return set is the dev set or validation
-    """
-    if dev:
-        temp_embs = [embeddings[idx] for idx in dev_indices if response_df['temperature'][idx]==temp]
-        temp_targs = [model_nums[idx] for idx in dev_indices if response_df['temperature'][idx]==temp]
-        return train_test_split(temp_embs, temp_targs, test_size=0.2, random_state=RANDOM_STATE)
-    if not dev:
-        return ([embeddings[idx] for idx in val_indices if response_df['temperature'][idx]==temp],
-            [model_nums[idx] for idx in val_indices if response_df['temperature'][idx]==temp])
-
-temp_0_train, temp_0_test, temp_0_targs_train, temp_0_targs_test = extract_and_split_dev(0)
-temp_7_train, temp_7_test, temp_7_targs_train, temp_7_targs_test = extract_and_split_dev(0.7)
-temp_14_train, temp_14_test, temp_14_targs_train, temp_14_targs_test = extract_and_split_dev(1.4)
-temp_0_val, temp_0_val_targs = extract_and_split_dev(0, False)
-temp_7_val, temp_7_val_targs = extract_and_split_dev(0.7, False)
-temp_14_val, temp_14_val_targs = extract_and_split_dev(1.4, False)
-temp_all_val, temp_all_val_targs = [embeddings[idx] for idx in val_indices],[model_nums[idx] for idx in val_indices]
-def extract_and_split_dev(temp, dev=True):
-    """
-    Returns split train, test, and dev sets based on temperature
-
-    temp: float indicating temperature
-    dev: boolean indicating if the return set is the dev set or validation
-    """
-    if dev:
-        temp_embs = [embeddings[idx] for idx in dev_indices if response_df['temperature'][idx]==temp]
-        temp_targs = [model_nums[idx] for idx in dev_indices if response_df['temperature'][idx]==temp]
-        return train_test_split(temp_embs, temp_targs, test_size=0.2, random_state=RANDOM_STATE)
-    if not dev:
-        return ([embeddings[idx] for idx in val_indices if response_df['temperature'][idx]==temp],
-            [model_nums[idx] for idx in val_indices if response_df['temperature'][idx]==temp])
-
-temp_0_train, temp_0_test, temp_0_targs_train, temp_0_targs_test = extract_and_split_dev(0)
-temp_7_train, temp_7_test, temp_7_targs_train, temp_7_targs_test = extract_and_split_dev(0.7)
-temp_14_train, temp_14_test, temp_14_targs_train, temp_14_targs_test = extract_and_split_dev(1.4)
-temp_0_val, temp_0_val_targs = extract_and_split_dev(0, False)
-temp_7_val, temp_7_val_targs = extract_and_split_dev(0.7, False)
-temp_14_val, temp_14_val_targs = extract_and_split_dev(1.4, False)
-temp_all_val, temp_all_val_targs = [embeddings[idx] for idx in val_indices],[model_nums[idx] for idx in val_indices]
-
-temp_all_embs = [embeddings[idx] for idx in dev_indices]
-temp_all_targs = [model_nums[idx] for idx in dev_indices]
-temp_all_train, temp_all_test, temp_all_targs_train, temp_all_targs_test = train_test_split(
-    temp_all_embs, temp_all_targs, test_size = 0.2, random_state = RANDOM_STATE)
-
-
+import torch.utils.data as data
 class FAM(nn.Module):
     def __init__(self, embed_size, hidden_size, hidden_dropout_prob):
         super().__init__()
@@ -170,7 +93,6 @@ class Classifier(nn.Module):
     def forward(self, feature):
         return self.fc(torch.tanh(feature))
 
-
 class WordEmbeddingDataset(Dataset):
     """
     Custom dataset object to feed into the dataloader
@@ -200,47 +122,34 @@ class WordEmbeddingDataset(Dataset):
         """
         return self.embs[idx], self.targs[idx]
 
-# Use batch size of 100
-BATCH_SIZE = 100
-
-# Create datasets to be used in data loaders
-dataset_0 = WordEmbeddingDataset(temp_0_train, temp_0_targs_train)
-dataset_0_test = WordEmbeddingDataset(temp_0_test, temp_0_targs_test)
-
-dataset_7 =  WordEmbeddingDataset(temp_7_train, temp_7_targs_train)
-dataset_7_test = WordEmbeddingDataset(temp_7_test, temp_7_targs_test)
-
-dataset_14 = WordEmbeddingDataset(temp_14_train, temp_14_targs_train)
-dataset_14_test = WordEmbeddingDataset(temp_14_test, temp_14_targs_test)
-
-dataset_all = WordEmbeddingDataset(temp_all_train, temp_all_targs_train)
-dataset_all_test = WordEmbeddingDataset(temp_all_test, temp_all_targs_test)
-
-# Create all dataloaders
-data_loader_0_train = DataLoader(dataset_0, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-data_loader_0_test = DataLoader(dataset_0_test, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-
-data_loader_7_train = DataLoader(dataset_7, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-data_loader_7_test = DataLoader(dataset_7_test, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-
-data_loader_14_train = DataLoader(dataset_14, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-data_loader_14_test = DataLoader(dataset_14_test, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-
-data_loader_all_train = DataLoader(dataset_all, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-data_loader_all_test = DataLoader(dataset_all_test, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
-
-
-class ModelGenerator():
+class Model():
     """
     Because there are dropout layers in the networks, each training session will have inherent stochasticity. We
     will build many models and pick the best one
     """
 
-    def __init__(self, data_loader_train, data_loader_test):
+    def __init__(self, data_loader_train, data_loader_val, filepath=None,
+                 hidden_size=None):
+        RANDOM_STATE = 42
+        DROPOUT_PERCENT = 0.3
+        NUM_CLASSES = 3
+        self.rng = np.random.default_rng(RANDOM_STATE)
+        self.num_features = data_loader_train.dataset[0][0].size(1)
         self.data_loader_train = data_loader_train
-        self.data_loader_test = data_loader_test
+        self.data_loader_val = data_loader_val
+        self.preds = []
+        self.targs = []
 
-    def train(self):
+
+
+        if filepath:
+            model_data = torch.load(filepath)
+            self.fam = FAM(self.num_features, hidden_size, DROPOUT_PERCENT)
+            self.classifier = Classifier(hidden_size, NUM_CLASSES, DROPOUT_PERCENT)
+            self.fam.load_state_dict(model_data['fam_state_dict'])
+            self.classifier.load_state_dict(model_data['classifier_state_dict'])
+
+    def train(self, data_loader):
         """
         Model training function
 
@@ -267,7 +176,7 @@ class ModelGenerator():
         n_batches = 0
         train_loss = 0
 
-        for data in self.data_loader_train:
+        for data in data_loader:
             # Start model training
             n_batches += 1
             self.optimizer.zero_grad()
@@ -300,7 +209,7 @@ class ModelGenerator():
 
         return average_loss, accuracy
 
-    def evaluate(self):
+    def evaluate(self, data_loader):
         """
         fa_module: optimized FAM object used to generate features
         classifier: optimized Classifier object used to classify features from fa_module
@@ -315,106 +224,126 @@ class ModelGenerator():
 
         correct = 0
         total = 0
-
+        accuracies = []
         # Evaluation the FAM and Classifier
         with torch.no_grad():
-            for data in self.data_loader_test:
+            for data in data_loader:
                 embs = data[0].squeeze(1)
                 targets = data[1].tolist()
 
                 fam_output = self.fam(embs)
                 final_output = self.classifier(fam_output)
                 preds = final_output.argmax(1).tolist()
-
+                self.preds.append(preds)
+                self.targs.append(targets)
                 total += len(preds)
                 correct += np.sum(np.array(preds) == np.array(targets))
 
         accuracy = correct / total
         return accuracy
 
-    def gen_model(self, hidden_size_2, supconloss_temp):
+    def gen_model(self, hidden_size, supcontemp):
         """
         Generates the best model based on test set accuracy
         """
         # Declare constants for networks
-        HIDDEN_SIZE_1 = 256
+        self.hidden_size = hidden_size
+        self.supcontemp = supcontemp
+        HIDDEN_SIZE_2 = 128
         DROPOUT_PERCENT = 0.3
+        NUM_CLASSES = 3
         LEARNING_RATE = 0.001
         STEP_SIZE = 20
         GAMMA = 0.5
-        self.hidden_size_2 = hidden_size_2
-        self.supconloss_temp = supconloss_temp
-        NUM_CLASSES = 3
         STOP_EARLY_NUM = 10
         NUM_MODELS = 10
+        k = 5
+        best_val_acc = 0
+        kfold = KFold(n_splits=k, shuffle=True)
+        dataset = self.data_loader_train.dataset
 
-        # Keep track of the best test accuracy
-        best_test_acc = 0
         for i in tqdm(range(NUM_MODELS)):
-            self.fam = FAM(NUM_FEATURES, HIDDEN_SIZE_1, DROPOUT_PERCENT)
-            self.proj = Projection(HIDDEN_SIZE_1, self.hidden_size_2)
-            self.classifier = Classifier(HIDDEN_SIZE_1, NUM_CLASSES, DROPOUT_PERCENT)
-            self.optimizer = optimizer = torch.optim.Adam(list(self.fam.parameters()) +
-                                                          list(self.proj.parameters()) +
-                                                          list(self.classifier.parameters()),
-                                                          lr=LEARNING_RATE)
-            self.scheduler = scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=STEP_SIZE,
-                                                                         gamma=GAMMA)
-            self.classifier_loss = nn.CrossEntropyLoss()
-            self.supcon_loss = SupConLoss(self.supconloss_temp)
-            i = 0
-            best_acc = 0
-            # Utilize 'stopping early' when 10 successive models have failed to improve
-            while i < STOP_EARLY_NUM:
-                loss, acc = self.train()
-                if acc > best_acc:
-                    best_acc = acc
-                    best_fam = self.fam.state_dict()
-                    best_proj = self.proj.state_dict()
-                    best_classifier = self.classifier.state_dict()
-                    i = 0
-                else:
-                    i += 1
-                scheduler.step()
+            fold_accs = []
+            for fold, (train_idx, val_idx) in enumerate(kfold.split(dataset)):
+                train_subsampler = data.SubsetRandomSampler(train_idx)
+                val_subsampler = data.SubsetRandomSampler(val_idx)
 
-            # Load the best training model for test set evaluation
-            self.fam.load_state_dict(best_fam)
-            self.proj.load_state_dict(best_proj)
-            self.classifier.load_state_dict(best_classifier)
-            test_accuracy = self.evaluate()
+                train_loader = torch.utils.data.DataLoader(dataset, sampler=train_subsampler,
+                                                           batch_size=self.data_loader_train.batch_size)
+                val_loader = torch.utils.data.DataLoader(dataset, sampler=val_subsampler,
+                                                         batch_size=self.data_loader_train.batch_size)
 
-            if test_accuracy > best_test_acc:
-                # If this model performs better than previous models, update overall best
-                best_test_acc = test_accuracy
-                overall_best_fam = best_fam
-                overall_best_proj = best_proj
-                overall_best_classifier = best_classifier
-        self.fam.load_state_dict(overall_best_fam)
-        self.proj.load_state_dict(overall_best_proj)
-        self.classifier.load_state_dict(overall_best_classifier)
+                self.fam = FAM(self.num_features, self.hidden_size, DROPOUT_PERCENT)
+                self.proj = Projection(self.hidden_size, HIDDEN_SIZE_2)
+                self.classifier = Classifier(self.hidden_size, NUM_CLASSES, DROPOUT_PERCENT)
+                self.optimizer = optimizer = torch.optim.Adam(list(self.fam.parameters()) +
+                                                              list(self.proj.parameters()) +
+                                                              list(self.classifier.parameters()),
+                                                              lr=LEARNING_RATE)
+                self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=STEP_SIZE, gamma=GAMMA)
+                self.classifier_loss = nn.CrossEntropyLoss()
+                self.supcon_loss = SupConLoss(supcontemp)
 
-    def test_accuracy(self, data_loader_test):
-        self.fam.eval()
-        self.classifier.eval()
+                # Early stopping
+                i = 0
+                best_training_acc = 0
+                while i < STOP_EARLY_NUM:
+                    loss, acc = self.train(train_loader)
+                    if acc > best_training_acc:
+                        best_training_acc = acc
+                        best_fam = self.fam.state_dict()
+                        best_proj = self.proj.state_dict()
+                        best_classifier = self.classifier.state_dict()
+                        i = 0
+                    else:
+                        i += 1
+                    self.scheduler.step()
 
-        correct = 0
-        total = 0
+                # Evaluate on the validation set
+                self.fam.load_state_dict(best_fam)
+                self.proj.load_state_dict(best_proj)
+                self.classifier.load_state_dict(best_classifier)
+                val_accuracy = self.evaluate(val_loader)
+                fold_accs.append(val_accuracy)
 
-        # Evaluation the FAM and Classifier
-        with torch.no_grad():
-            for data in self.data_loader_test:
-                embs = data[0].squeeze(1)
-                targets = data[1].tolist()
+            if np.mean(fold_accs) > best_val_acc:
+                best_val_acc = np.mean(fold_accs)
+                self.overall_best_fam = best_fam
+                self.overall_best_proj = best_proj
+                self.overall_best_classifier = best_classifier
+                print('**MODEL UPDATED**')
+                print('Average Training Accuracy: ' + str(best_training_acc))
+                print('Best Validation Accuracy: ' + str(np.mean(fold_accs)))
+        self.fam.load_state_dict(self.overall_best_fam)
+        self.proj.load_state_dict(self.overall_best_proj)
+        self.classifier.load_state_dict(self.overall_best_classifier)
 
-                fam_output = self.fam(embs)
-                final_output = self.classifier(fam_output)
-                preds = final_output.argmax(1).tolist()
+    def get_bootstrap_dataloader(self, embs, targs):
+        BATCH_SIZE = 100
+        np.random.seed(42)
+        num_samples = len(embs)
+        bootstrap_indices = self.rng.choice(np.arange(num_samples), size=num_samples, replace=True)
+        sample_embs = [embs[idx] for idx in bootstrap_indices]
+        sample_targs = [targs[idx] for idx in bootstrap_indices]
+        dataset = WordEmbeddingDataset(sample_embs, sample_targs)
+        data_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+        return data_loader
 
-                total += len(preds)
-                correct += np.sum(np.array(preds) == np.array(targets))
+    def run_bootstrap(self, num_iterations, embs, targs):
+        accuracies = []
+        for _ in tqdm(range(num_iterations)):
+            data_loader = self.get_bootstrap_dataloader(embs, targs)
+            accuracy = self.evaluate(data_loader)
+            accuracies.append(accuracy)
+        return accuracies
 
-        accuracy = correct / total
-        return accuracy
+    def save_model(self, filepath):
+        # Save the best models to disk
+        torch.save({'fam_state_dict': self.overall_best_fam,
+                    'proj_state_dict': self.overall_best_proj,
+                    'classifier_state_dict': self.overall_best_classifier,
+                    }, filepath)
 
-
-
+    def reset_preds_targs(self):
+        self.preds = []
+        self.targs = []
