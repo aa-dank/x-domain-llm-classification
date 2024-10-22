@@ -135,7 +135,7 @@ class MisinfoTsneAnalyzer:
         # if the model data temp is a digit, we will find index of the temp in the raw data 'temperature' column.
         # Then we will use those index to retrieve/filter the embeddings, features embeddings, model labels and temp labels
         if str(model_data_temp).isdigit():
-            model_data_temp = float(model_data_temp)  # Ensure it's the correct type for comparison
+            model_data_temp = float(model_data_temp)
             temp_index = data[data['temperature'] == model_data_temp].index
             embeds = np.array(embeds)[temp_index]
             feats_embeds = np.array(feats_embeds)[temp_index]
@@ -303,3 +303,210 @@ class MisinfoTsneAnalyzer:
         if verbose:
             print(f"Best silhouette score: {self.best_score} with parameters:\n{self.tsne_params}\n") 
             print(f"Results saved to: {results_csv_path}")
+
+class TsneGridPlotter:
+    def __init__(
+        self,
+        raw_data_path: str,
+        embeds_path: str,
+        features_embeds_path: str,
+        model_path_template: str,
+        output_dir: str = "tsne_grid_plots",
+        random_state: int = 42
+    ):
+        self.raw_data_path = raw_data_path
+        self.embeds_path = embeds_path
+        self.features_embeds_path = features_embeds_path
+        self.model_path_template = model_path_template
+        self.output_dir = output_dir
+        self.random_state = random_state
+
+        self.device = get_device()
+        os.makedirs(self.output_dir, exist_ok=True)
+
+        # Load data
+        self.data = pd.read_csv(self.raw_data_path)
+        self.model_labels = self.data['model'].values
+        self.temp_labels = self.data['temperature'].values.astype(float)
+        self.temperatures = [1.4, 0.7, 0.0]  # Temperatures for rows
+        self.perplexities = [30, 50, 100]  # Perplexities for columns
+
+        # Load embeddings
+        with open(self.embeds_path, 'rb') as f:
+            self.embeds = pickle.load(f)
+        with open(self.features_embeds_path, 'rb') as f:
+            self.feats_embeds = pickle.load(f)
+
+        # Convert embeddings to tensors
+        self.embeds_array = np.array(self.embeds)
+        self.feats_embeds_array = np.array(self.feats_embeds)
+        self.embeds_tensor = torch.tensor(self.embeds_array, dtype=torch.float32).to(self.device)
+        self.feats_embeds_tensor = torch.tensor(self.feats_embeds_array, dtype=torch.float32).to(self.device)
+
+        # Flatten if embeddings are 3D with a second dimension of 1
+        if len(self.embeds_tensor.size()) == 3 and self.embeds_tensor.size(1) == 1:
+            self.embeds_tensor = self.embeds_tensor.view(self.embeds_tensor.size(0), -1)
+
+        # Concatenate embeddings
+        self.extended_embeds_tensor = torch.cat((self.embeds_tensor, self.feats_embeds_tensor), dim=1)
+
+        # Ensure temperatures are floats
+        self.data['temperature'] = self.data['temperature'].astype(float)
+
+    def load_model_for_temperature(self, temperature: Union[float, None]):
+        """
+        Load the FAM model state for the given temperature.
+        """
+        # Prepare the model
+        model = FAM(embed_size=self.extended_embeds_tensor.size(1), hidden_size=256, hidden_dropout_prob=0.3).to(self.device)
+
+        # Handle 'all' case
+        if temperature is None:
+            temp_value = 'all'
+        else:
+
+            # Determine the correct path based on temperature
+            temp_value = temperature
+            temp_to_path_int = lambda temp_float: int(float(temp_float) * 10)
+            try:
+                temp_value = temp_to_path_int(temperature)
+            except:
+                pass
+
+
+        # Construct the model path
+        model_path = self.model_path_template.format(temp_value)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Model file not found for temperature {temperature}: {model_path}")
+
+        # Load the state dictionary
+        state_dict = torch.load(model_path, map_location=self.device)
+        fam_state_dict = state_dict['fam_state_dict']
+
+        # Load the model state
+        model.load_state_dict(fam_state_dict)
+        model.eval()  # Set model to evaluation mode
+
+        return model
+
+    def filter_data_by_temperature(self, temperature: Union[float, None]):
+        if temperature is not None:
+            temp_index = np.where(self.temp_labels == temperature)[0]
+        else:
+            temp_index = np.arange(len(self.temp_labels))  # All data
+
+        filtered_embeds = self.extended_embeds_tensor[temp_index]
+        filtered_model_labels = self.model_labels[temp_index]
+        filtered_temp_labels = self.temp_labels[temp_index]
+        return filtered_embeds, filtered_model_labels, filtered_temp_labels
+
+    def run_tsne(self, embeddings, perplexity):
+        tsne = TSNE(
+            n_components=2,
+            perplexity=perplexity,
+            n_iter=1000,
+            learning_rate=200,
+            init='random',
+            random_state=self.random_state,
+            method='barnes_hut'
+        )
+        tsne_embeds = tsne.fit_transform(embeddings)
+        return tsne_embeds
+
+    def create_grid_plot(self):
+        num_rows = len(self.temperatures) + 1  # Add one for 'all temperatures' row
+        num_cols = len(self.perplexities)
+        fig, axes = plt.subplots(num_rows, num_cols, figsize=(5 * num_cols, 5 * num_rows))
+
+        # Iterate over temperatures (rows)
+        for row_idx, temp in enumerate(self.temperatures + [None]):  # None represents 'all temperatures'
+            # Load the model for the current temperature
+            model = self.load_model_for_temperature(temp)
+
+            # Filter data for the current temperature
+            filtered_embeds, filtered_model_labels, filtered_temp_labels = self.filter_data_by_temperature(temp)
+
+            # Generate embeddings from the model
+            with torch.no_grad():
+                transformed_embeds = model(filtered_embeds.to(self.device)).cpu().numpy()
+
+            # Limit the number of points to 900
+            num_points = min(900, len(transformed_embeds))
+            indices = np.random.choice(len(transformed_embeds), num_points, replace=False)
+            transformed_embeds = transformed_embeds[indices]
+            filtered_model_labels = filtered_model_labels[indices]
+            filtered_temp_labels = filtered_temp_labels[indices]
+
+            # Iterate over perplexities (columns)
+            for col_idx, perplexity in enumerate(self.perplexities):
+                ax = axes[row_idx, col_idx]
+
+                # Run t-SNE
+                tsne_embeds = self.run_tsne(transformed_embeds, perplexity)
+
+                # Create DataFrame for plotting
+                viz_df = pd.DataFrame(tsne_embeds, columns=['x', 'y'])
+                viz_df['model'] = filtered_model_labels
+                viz_df['temperature'] = filtered_temp_labels
+
+                # Plot
+                sns.scatterplot(
+                    data=viz_df,
+                    x='x',
+                    y='y',
+                    hue='model',
+                    ax=ax,
+                    legend=False,
+                    palette='colorblind',
+                    s=10
+                )
+
+                # Remove individual titles and labels
+                ax.set_xlabel('')
+                ax.set_ylabel('')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+                ax.spines['left'].set_visible(False)
+                ax.spines['bottom'].set_visible(False)
+
+                # add legend  to top right plot
+                if row_idx == 0 and col_idx == num_cols - 1:
+                    ax.legend(loc='center right', title='Model', title_fontsize=10)
+
+        # Adjust layout to make room for labels
+        plt.subplots_adjust(left=0.1, right=0.85, top=0.9, bottom=0.1, wspace=0.05, hspace=0.05)
+
+        # Add column labels (perplexities) at the top
+        for col_idx, perplexity in enumerate(self.perplexities):
+            col_ax = axes[0, col_idx]
+            # Get position of the axis
+            pos = col_ax.get_position()
+            x = pos.x0 + pos.width / 2
+            y = pos.y1 + 0.02  # Slightly above the axis
+            fig.text(x, y, f'Perplexity: {perplexity}', ha='center', va='bottom', fontsize=16)
+
+        # Add row labels (temperatures) on the left
+        for row_idx, temp in enumerate(self.temperatures + [None]):
+            row_ax = axes[row_idx, 0]
+            # Get position of the axis
+            pos = row_ax.get_position()
+            x = pos.x0 - 0.02  # Slightly to the left of the axis
+            y = pos.y0 + pos.height / 2
+            temp_label = f"Temperature: {temp}" if temp is not None else "All Temperatures"
+            fig.text(x, y, temp_label, ha='right', va='center', rotation=90, fontsize=16)
+
+        # Adjust legend
+        handles, labels = ax.get_legend_handles_labels()
+        fig.legend(handles, labels, loc='center right', bbox_to_anchor=(0.92, 0.5), fontsize=12)
+
+        output_path = os.path.join(self.output_dir, "tsne_grid_plot.png")
+        try:
+            plt.savefig(output_path, bbox_inches='tight')
+        except Exception as e:
+            print(f"Error saving grid plot to {output_path}: {e}")
+
+        plt.show()
+        plt.close()
+        print(f"Grid plot saved to {output_path}")
